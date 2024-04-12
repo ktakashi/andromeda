@@ -19,10 +19,14 @@
 #!nounbound
 #!read-macro=sagittarius/bv-string
 (library (andromeda slip :10)
-    (export generate-master-key slip-curve
+    (export generate-master-key
 	    derive-private-key derive-public-key
 
-	    deriveable-key? deriveable-key-k deriveable-key-c
+	    *curve:secp256k1*
+	    *curve:nist256p1*
+	    *curve:ed25519*
+	    
+	    derivable-key? derivable-key-k derivable-key-c
 	    hardened-child-key)
     (import (rnrs)
 	    (sagittarius)
@@ -36,7 +40,7 @@
 (define *nist-256p1-seed* #*"Nist256p1 seed")
 (define *ed25519-seed*    #*"ed25519 seed")
 
-(define-record-type deriveable-key (fields k c))
+(define-record-type derivable-key (fields curve k c))
 
 (define-enumeration slip-curve
   (secp256k1 nist256p1 ed25519)
@@ -44,28 +48,31 @@
 (define *slip-curves* (enum-set-universe (slip-curves)))
 (define (slip-curve? v) (enum-set-member? v *slip-curves*))
 
+(define *curve:secp256k1* (slip-curve secp256k1))
+(define *curve:nist256p1* (slip-curve nist256p1))
+(define *curve:ed25519*   (slip-curve ed25519))
+
 (define (generate-master-key (curve slip-curve?) (S bytevector?))
   (define (check param a)
     (and (< a (ec-parameter-n param)) (not (zero? a))))
   (unless (<= 128 (* (bytevector-length S) 8) 512)
     (assertion-violation 'generate-master-key
 			 "S must be 128bit to 512bit in length"))
-  (let-values (((param master-seed) (slip-curve->curve&seed curve)))
-    (let loop ((seed master-seed))
-      (let* ((mac (make-mac *mac:hmac* seed :digest *digest:sha-512*))
-	     (I (generate-mac mac S)))
+  (let-values (((param modifier) (slip-curve->curve&seed curve)))
+    (let loop ((seed S))
+      (let* ((mac (make-mac *mac:hmac* modifier :digest *digest:sha-512*))
+	     (I (generate-mac mac seed)))
 	(let-values (((IL IR) (bytevector-split-at* I 32)))
 	  (if (or (not param) (check param (bytevector->uinteger IL)))
-	      (make-deriveable-key IL IR)
+	      (make-derivable-key param IL IR)
 	      (loop I)))))))
 
 (define (hardened-child-key i) (+ i (expt 2 31)))
 (define (hardened-key? i) (>= i (expt 2 31)))
-(define (derive-private-key (curve slip-curve?)
-			    (key deriveable-key?)
-			    i)
-  (define k (deriveable-key-k key))
-  (define c (deriveable-key-c key))
+(define (derive-private-key (key derivable-key?) i)
+  (define k (derivable-key-k key))
+  (define c (derivable-key-c key))
+  (define param (derivable-key-curve key))
   (define uk (bytevector->uinteger k))
   (define (check param IL k)
     (let* ((a (bytevector->uinteger IL))
@@ -79,34 +86,31 @@
   (unless (= (bytevector-length c) 32)
     (assertion-violation 'derive-private-key "Invalid length of c"))
   (bytevector-u32-set! buf 0 i (endianness big))
-  (let-values (((param _) (slip-curve->curve&seed curve)))
-    (let loop ((d (if (hardened-key? i)
-		      (bytevector-append #vu8(#x00) k buf)
-		      (bytevector-append (derive-public-key curve key) buf))))
-      (let* ((mac (make-mac *mac:hmac* c :digest *digest:sha-512*))
-	     (I (generate-mac mac d)))
-	(let-values (((IL IR) (bytevector-split-at* I 32)))
-	  (cond ((not param) (make-deriveable-key IL IR))
-		((check param IL k) =>
-		 (lambda (key) (make-deriveable-key key IR)))
-		(else (loop (bytevector-append #vu8(#x01) IR buf)))))))))
+  (let loop ((d (if (hardened-key? i)
+		    (bytevector-append #vu8(#x00) k buf)
+		    (bytevector-append (derive-public-key key) buf))))
+    (let* ((mac (make-mac *mac:hmac* c :digest *digest:sha-512*))
+	   (I (generate-mac mac d)))
+      (let-values (((IL IR) (bytevector-split-at* I 32)))
+	(cond ((not param) (make-derivable-key param IL IR))
+	      ((check param IL k) =>
+	       (lambda (key) (make-derivable-key param key IR)))
+	      (else (loop (bytevector-append #vu8(#x01) IR buf))))))))
 
-(define (derive-public-key (curve slip-curve?) (key deriveable-key?))
-  (define k (deriveable-key-k key))
-  (case curve
-    ((ed25519)
-     (bytevector-append #vu8(#x00)
-      (eddsa-public-key-data
-       (eddsa-private-key-public-key (generate-private-key *key:ed25519* k)))))
-    (else
-     (let-values (((param _) (slip-curve->curve&seed curve)))
-       (let* ((Q (ec-point-mul (ec-parameter-curve param)
-			       (ec-parameter-g param)
-			       (bytevector->uinteger k)))
-	      (pk (uinteger->bytevector (ec-point-x Q) 32))
-	      (parity (make-bytevector 1)))
-	 (bytevector-u8-set! parity 0 (+ 2 (bitwise-and (ec-point-y Q) 1)))
-	 (bytevector-append parity pk))))))
+(define (derive-public-key (key derivable-key?))
+  (define k (derivable-key-k key))
+  (define param (derivable-key-curve key))
+  (if param
+      (let* ((Q (ec-point-mul (ec-parameter-curve param)
+			      (ec-parameter-g param)
+			      (bytevector->uinteger k)))
+	     (pk (uinteger->bytevector (ec-point-x Q) 32))
+	     (parity (make-bytevector 1)))
+	(bytevector-u8-set! parity 0 (+ 2 (bitwise-and (ec-point-y Q) 1)))
+	(bytevector-append parity pk))
+      (bytevector-append #vu8(#x00)
+       (eddsa-public-key-data
+	(eddsa-private-key-public-key (generate-private-key *key:ed25519* k))))))
 
 (define (slip-curve->curve&seed curve)
   (case curve
