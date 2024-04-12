@@ -6,10 +6,18 @@
 
 (test-begin "SLIP-0010")
 
+(test-error "Seed length < 128 bit"
+	    (generate-master-key *curve:ed25519* (make-bytevector 15)))
+(test-error "Seed length > 512 bit"
+	    (generate-master-key *curve:ed25519* (make-bytevector 65)))
+(let ((mk (generate-master-key *curve:ed25519* (make-bytevector 16))))
+  (test-error "ed25519 non hardend-key" (derive-private-key mk 0)))
+
 (define (test-vector-test curve seed chains)
   (define chain (car chains))
   (let* ((mk (generate-master-key curve seed))
 	 (pk (derive-public-key mk)))
+    (test-assert (master-key? mk))
     (test-assert (derivable-key? mk))
     (test-assert (private-key? (derivable-key->private-key mk)))
     (test-assert (derived-public-key? pk))
@@ -25,6 +33,7 @@
      (lambda (k chain)
        (let* ((priv (derive-private-key k (cadddr chain)))
 	      (pubk (derive-public-key priv)))
+	 (test-assert (not (master-key? priv)))
 	 (test-assert (derivable-key? priv))
 	 (test-assert (private-key? (derivable-key->private-key priv)))
 	 (test-assert (derived-public-key? pubk))
