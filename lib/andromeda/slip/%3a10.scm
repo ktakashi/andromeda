@@ -27,6 +27,10 @@
 	    *curve:ed25519*
 	    
 	    derivable-key? derivable-key-k derivable-key-c
+	    derivable-key->private-key
+	    derived-public-key?
+	    derived-public-key-raw-value
+	    derived-public-key->public-key
 	    hardened-child-key)
     (import (rnrs)
 	    (sagittarius)
@@ -40,7 +44,22 @@
 (define *nist-256p1-seed* #*"Nist256p1 seed")
 (define *ed25519-seed*    #*"ed25519 seed")
 
-(define-record-type derivable-key (fields curve k c))
+(define-record-type derivable-key
+  (fields curve k c >private-key)
+  (protocol
+   (lambda (p)
+     (define (->private-key curve k)
+       (if curve
+	   (generate-private-key *key:ecdsa* (bytevector->uinteger k) curve)
+	   (generate-private-key *key:ed25519* k)))
+     (lambda (curve k c)
+       (let ((private-key (->private-key curve k)))
+	 (p curve k c private-key))))))
+(define-record-type derived-public-key
+  (fields curve
+	  raw-value
+	  ;; lazy way to make it look like conversion procedure :)
+	  >public-key))
 
 (define-enumeration slip-curve
   (secp256k1 nist256p1 ed25519)
@@ -80,6 +99,8 @@
       (and (< a (ec-parameter-n param))
 	   (not (zero? key))
 	   (uinteger->bytevector key 32))))
+  (define (raw-public-key key)
+    (derived-public-key-raw-value (derive-public-key key)))
   (define buf (make-bytevector 4))
   (unless (= (bytevector-length k) 32)
     (assertion-violation 'derive-private-key "Invalid length of k"))
@@ -88,7 +109,7 @@
   (bytevector-u32-set! buf 0 i (endianness big))
   (let loop ((d (if (hardened-key? i)
 		    (bytevector-append #vu8(#x00) k buf)
-		    (bytevector-append (derive-public-key key) buf))))
+		    (bytevector-append (raw-public-key key) buf))))
     (let* ((mac (make-mac *mac:hmac* c :digest *digest:sha-512*))
 	   (I (generate-mac mac d)))
       (let-values (((IL IR) (bytevector-split-at* I 32)))
@@ -105,12 +126,19 @@
 			      (ec-parameter-g param)
 			      (bytevector->uinteger k)))
 	     (pk (uinteger->bytevector (ec-point-x Q) 32))
+	     ;; compression mode, #x02 or #x03
+	     ;; maybe we should make a procedure to convert points to
+	     ;; compressed format
 	     (parity (make-bytevector 1)))
-	(bytevector-u8-set! parity 0 (+ 2 (bitwise-and (ec-point-y Q) 1)))
-	(bytevector-append parity pk))
-      (bytevector-append #vu8(#x00)
-       (eddsa-public-key-data
-	(eddsa-private-key-public-key (generate-private-key *key:ed25519* k))))))
+	(bytevector-u8-set! parity 0 (if (even? (ec-point-y Q)) 2 3))
+	(make-derived-public-key param
+	 (bytevector-append parity pk)
+	 (generate-public-key *key:ecdsa* (ec-point-x Q) (ec-point-y Q) param)))
+      (let ((public-key (eddsa-private-key-public-key 
+			 (generate-private-key *key:ed25519* k))))
+	(make-derived-public-key #f
+	 (bytevector-append #vu8(#x00) (eddsa-public-key-data public-key))
+	 public-key))))
 
 (define (slip-curve->curve&seed curve)
   (case curve
